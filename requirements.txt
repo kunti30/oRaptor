@@ -1,0 +1,5 @@
+pandas==2.0.3
+yfinance==0.2.36
+matplotlib==3.7.1
+requests==2.31.0
+python-telegram-bot==20.3
