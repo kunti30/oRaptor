@@ -2,23 +2,20 @@ import os
 import requests
 import pandas as pd
 import yfinance as yf
-import pytz
 from datetime import datetime
 import json
-import matplotlib.pyplot as plt
 
 # ==============================
 # CONFIG
 # ==============================
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 PAIRS = {
     "GOLD": {"ticker": "XAUUSD=X", "risk": 1.0},
     "USDJPY": {"ticker": "JPY=X", "risk": 0.7},
-    "BTC": {"ticker": "BTC-USD", "risk": 1.0},
-    "ETH": {"ticker": "ETH-USD", "risk": 0.8}
+    "BTCUSD": {"ticker": "BTC-USD", "risk": 1.2},
+    "ETHUSD": {"ticker": "ETH-USD", "risk": 1.2}
 }
 
 R_MULTIPLIER = 1.7
@@ -28,7 +25,6 @@ STATS_FILE = "stats.json"
 # ==============================
 # TELEGRAM FUNCTION
 # ==============================
-
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
@@ -37,7 +33,6 @@ def send_telegram(message):
 # ==============================
 # SESSION CONTROL
 # ==============================
-
 def get_session():
     now = datetime.utcnow().hour
     if 6 <= now < 12:
@@ -47,30 +42,23 @@ def get_session():
     else:
         return "Asia"
 
-def session_already_alerted(pair, session):
+def session_already_alerted(session):
     if not os.path.exists(SESSION_ALERT_FILE):
         return False
     with open(SESSION_ALERT_FILE, "r") as f:
         data = json.load(f)
-    return data.get(pair) == session
+    return data.get("session") == session
 
-def save_session(pair, session):
-    if os.path.exists(SESSION_ALERT_FILE):
-        with open(SESSION_ALERT_FILE, "r") as f:
-            data = json.load(f)
-    else:
-        data = {}
-    data[pair] = session
+def save_session(session):
     with open(SESSION_ALERT_FILE, "w") as f:
-        json.dump(data, f)
+        json.dump({"session": session}, f)
 
 # ==============================
 # STATS SYSTEM
 # ==============================
-
 def load_stats():
     if not os.path.exists(STATS_FILE):
-        return {"balance": 10000, "wins":0, "losses":0, "streak_loss":0, "equity":[10000]}
+        return {"balance":10000, "wins":0, "losses":0, "streak_loss":0, "equity":[10000]}
     with open(STATS_FILE, "r") as f:
         return json.load(f)
 
@@ -79,40 +67,33 @@ def save_stats(stats):
         json.dump(stats, f)
 
 # ==============================
-# SIGNAL LOGIC
+# EQUITY CURVE
 # ==============================
+def generate_equity_curve(stats):
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(stats["equity"])
+    plt.title("Equity Curve")
+    plt.xlabel("Trades")
+    plt.ylabel("Balance")
+    plt.savefig("equity.png")
+    plt.close()
 
-def generate_signal(df, pair):
-    df["ema_fast"] = df["Close"].ewm(span=20).mean()
-    df["ema_slow"] = df["Close"].ewm(span=50).mean()
-    signal = None
-
-    # EMA crossover
-    if df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]:
-        signal = "BUY"
-    elif df["ema_fast"].iloc[-1] < df["ema_slow"].iloc[-1]:
-        signal = "SELL"
-
-    # Crypto filter
-    if pair in ["BTC", "ETH"] and signal:
-        last_close = df["Close"].iloc[-1]
-        prev_close = df["Close"].iloc[-2]
-        body_pct = abs(last_close - prev_close) / prev_close * 100
-        rsi = pd.Series(df["Close"]).diff().fillna(0).rolling(14).apply(lambda x: (x[x>0].sum()/(abs(x).sum()+1e-9))*100).iloc[-1]
-
-        if body_pct < 0.5:  # candle terlalu kecil → abaikan
-            signal = None
-        elif signal=="BUY" and rsi < 60:  # momentum tidak cukup
-            signal = None
-        elif signal=="SELL" and rsi > 40:
-            signal = None
-
-    return signal
+# ==============================
+# SIGNAL LOGIC (EMA CROSS)
+# ==============================
+def generate_signal(df):
+    df["ema20"] = df["Close"].ewm(span=20).mean()
+    df["ema50"] = df["Close"].ewm(span=50).mean()
+    if df["ema20"].iloc[-1] > df["ema50"].iloc[-1]:
+        return "BUY"
+    elif df["ema20"].iloc[-1] < df["ema50"].iloc[-1]:
+        return "SELL"
+    return None
 
 # ==============================
 # CORRELATION FILTER GOLD/USDJPY
 # ==============================
-
 def correlation_block(pair, signal, open_positions):
     if pair == "GOLD" and "USDJPY" in open_positions:
         if open_positions["USDJPY"] == signal:
@@ -123,40 +104,62 @@ def correlation_block(pair, signal, open_positions):
     return False
 
 # ==============================
+# ALERT CANDLE TERAKHIR
+# ==============================
+def send_last_candle_status(pair, df):
+    last = df.iloc[-1]
+    message = f"""
+══════════════════════════
+BOT STATUS ALERT
+══════════════════════════
+
+Instrument   : {pair}
+Last Candle  : {last.name} (UTC)
+Open         : {last['Open']:.3f}
+High         : {last['High']:.3f}
+Low          : {last['Low']:.3f}
+Close        : {last['Close']:.3f}
+
+Bot Status   : ACTIVE
+══════════════════════════
+"""
+    send_telegram(message)
+
+# ==============================
 # MAIN ENGINE
 # ==============================
-
 def run():
     session = get_session()
+    if session_already_alerted(session):
+        return
+
     stats = load_stats()
     open_positions = {}
 
     for pair, config in PAIRS.items():
-        # Session alert check
-        if session_already_alerted(pair, session):
-            continue
-
         df = yf.download(config["ticker"], period="5d", interval="15m")
         if df.empty:
             continue
 
-        signal = generate_signal(df, pair)
+        # Kirim alert candle terakhir untuk tahu bot aktif
+        send_last_candle_status(pair, df)
+
+        signal = generate_signal(df)
         if not signal:
             continue
 
-        # Correlation filter only for GOLD/USDJPY
+        # Filter korelasi GOLD & USDJPY
         if correlation_block(pair, signal, open_positions):
             continue
 
         price = df["Close"].iloc[-1]
-        sl = price * 0.998 if signal=="BUY" else price*1.002
-        tp = price + (price - sl)*R_MULTIPLIER if signal=="BUY" else price - (sl - price)*R_MULTIPLIER
+        sl = price * 0.998 if signal == "BUY" else price * 1.002
+        tp = price + (price - sl) * R_MULTIPLIER if signal == "BUY" else price - (sl - price) * R_MULTIPLIER
 
         risk = config["risk"]
         if stats["streak_loss"] >= 2:
             risk /= 2
 
-        # Telegram institutional style
         message = f"""
 ══════════════════════════
 EXECUTION NOTICE
@@ -164,12 +167,12 @@ EXECUTION NOTICE
 
 Instrument   : {pair}
 Session      : {session}
-Strategy     : {"Volatility Expansion (A+)" if pair in ['GOLD','USDJPY'] else "Crypto Momentum (A+)"}
+Strategy     : Volatility Expansion (A+)
 
 Direction    : {signal}
-Entry Price  : {price:.2f}
-Stop Loss    : {sl:.2f}
-Take Profit  : {tp:.2f}
+Entry Price  : {price:.3f}
+Stop Loss    : {sl:.3f}
+Take Profit  : {tp:.3f}
 
 Risk per Trade : {risk:.2f}%
 R-Multiple     : 1 : {R_MULTIPLIER}
@@ -180,11 +183,11 @@ Timestamp (UTC): {datetime.utcnow()}
 """
         send_telegram(message)
         open_positions[pair] = signal
-        save_session(pair, session)
+
+    save_session(session)
 
 # ==============================
 # RUN
 # ==============================
-
 if __name__ == "__main__":
     run()
